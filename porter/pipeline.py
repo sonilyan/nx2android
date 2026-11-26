@@ -10,7 +10,7 @@ from pathlib import Path
 from porter import config, datapack, dumps, fpslocker, install, paths, profiles, product_cache, romfs_pack, toolchain
 from porter.adb import NO_ADB, Adb, AdbError
 from porter.paths import DM, NXNATIVE
-from porter.upstream import BuildError, PROG, android_profile, game, nacp, nsp, profile_guess, say, trinity, uepak
+from porter.upstream import BuildError, PROG, android_profile, game, nacp, nsp, profile_guess, romfs, say, trinity, uepak
 
 PY = sys.executable
 # The overlay's font (Port.ui_font)
@@ -76,6 +76,7 @@ class Options:
     alias_headroom: int = None         # GB more alias region (alias_headroom); None: ALIAS_HEADROOM for a version the profile was not brought up on, none for one it was
     romfs_at: str = None               # with install: the folder on the device the app reads the RomFS from (porter/install.py), 'app' for its files folder; None: as the device has it
     romfs_push: bool = False           # with romfs_at: push the pack's RomFS into that folder first
+    romfs_container: bool = False      # read RomFS directly from the selected NSP/XCI; no extracted RomFS directory
     jobs: int = field(default_factory=lambda: os.cpu_count() or 8)
 
     @classmethod
@@ -243,6 +244,9 @@ class Port:
                     say(f'[RED] porter stopped on an error it does not expect; the traceback is in {work / "logs" / "crash.log"} (add it to a bug report)')
                 except OSError: pass
             raise
+        finally:
+            self.close_romfs_containers()
+            self.drop_unpacked()
 
     def _run(self):
         o = self.o
@@ -278,7 +282,8 @@ class Port:
             self.inputs()
             PROG.plan(1 + len(self.versions) + bool(self.fam['dlc']) + bool(o.firmware and self.ap.sysdata) + bool(o.fps60) + 6 + bool(o.install))   # nx_extract, the versions, the DLC, the system data, 60 fps, rewrite / split / Vulkan shaders / host / APK / data, install (unpack adds its own)
             self.extract()
-        finally: self.drop_unpacked()   # a failed run leaves no decompressed dumps behind either
+        finally:
+            if not o.romfs_container: self.drop_unpacked()   # container readers still need decompressed NSPs until all shader stages finish
         self.check_graphics()
         self.fps_unlock()
         self.rewrite()
@@ -308,9 +313,15 @@ class Port:
         self.provisional = False
         if not (g and ap):
             what = f'no game profile for {tid}' if not g else f'{g.get("name", g.id)} ({g.id}) has a game profile but is not ported to Android yet (no android.tsv in {g.dir})'
+            if o.romfs_container and not g:
+                raise BuildError('--romfs-container needs an existing game profile; the experimental survey currently requires an extracted RomFS')
             if not o.experimental: raise BuildError(f'{what}: --experimental tries it anyway (profiles: `porter profiles`)')
             g, ap = self.experimental_profile(g, tid)
         self.g, self.ap = g, ap
+        if o.romfs_container and ap.romfs_zstd:
+            raise BuildError(f'{g.id}: --romfs-container cannot be combined with android.tsv romfs zstd; this profile requires packed RomFS files')
+        if o.romfs_container and (o.romfs_at is not None or o.romfs_push):
+            raise BuildError('--romfs-container cannot be combined with --romfs-at or --romfs-push')
         self.package = o.package or ap.package
         if not re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+', self.package): raise BuildError(f'not a package name: {self.package}')
         say(f'game profile: {g.id} {g.get("name", "")} (Android: {ap.status}' + (f', tested on {ap.tested}' if ap.tested else '') + ')')
@@ -339,6 +350,69 @@ class Port:
         # DM_GAME picks the profile for every tool; WORK keeps their temporary folders inside the build folder (the shader translator writes thousands of files)
         self.env.update(DM_GAME=g.id, DM_ROOT=str(self.work), WORK=str(self.work / 'tmp'))
 
+    def romfs_container_identity(self, sources):
+        identity = []
+        for f in dict.fromkeys([*sources, self.container_keys]):
+            if f is None: continue
+            st = Path(f).stat()
+            identity.append((str(Path(f).resolve()), st.st_size, st.st_mtime_ns, st.st_ctime_ns, getattr(st, 'st_ino', 0)))
+        return hashlib.sha256(json.dumps(identity, separators=(',', ':')).encode()).hexdigest()
+
+    def mount_romfs_containers(self, picks):
+        """Mount every shader-version RomFS as a read-only view of its source NSP/XCI; no game files are extracted."""
+        self.romfs_mount_paths, self.romfs_backends = [], []
+        self._old_nsp_romfs = getattr(nsp, 'romfs', None)
+        self._old_collect_nros = nsp.collect_nros
+        nsp.romfs = romfs
+
+        def collect_nros_container(py, repo, root, dst, env, logs):
+            return self._old_collect_nros(py, repo, romfs.Path(root), dst, env, logs)
+        nsp.collect_nros = collect_nros_container
+
+        mounts = []
+        try:
+            for ver in self.versions:
+                base, update = picks[ver]
+                root = self.dirs[ver] / 'RomFS'
+                backend = romfs.Container(str(base), str(update) if update else None, str(self.container_keys), str(self.container_exe))
+                romfs.mount(root, backend)
+                self.romfs_mount_paths.append(root)
+                self.romfs_backends.append(backend)
+                mounts.append(dict(path=str(root), base=str(base), update=str(update) if update else None,
+                                   keys=str(self.container_keys), exe=str(self.container_exe)))
+                say(f'[ROMFS container] {ver}: mounted {base.name}' + (f' + {update.name}' if update and update != base else
+                     (' (merged base/update container)' if update == base else ' (base game only)')))
+            self.env['DM_ROMFS_MOUNTS'] = json.dumps(mounts, ensure_ascii=False)
+            keyfile = self.aw / 'romfs_container.key'
+            previous = keyfile.read_text(encoding='utf-8').strip() if keyfile.is_file() else ''
+            if previous != self.container_key:
+                say('[ROMFS container] source identity changed; invalidating RomFS-derived shader and NRO caches')
+                for f in (self.work / 'shader' / 'pkg.key', self.aw / f'nro_{self.pkg_ver}.key'):
+                    try: f.unlink()
+                    except FileNotFoundError: pass
+                for d in self.dirs.values():
+                    for name in ('ue_shaders', 'ue_legacy', 'glslc_capture'):
+                        nsp.rmtree(d / name)
+                keyfile.write_text(self.container_key + '\n', encoding='utf-8')
+            say(f'[ROMFS container] {len(mounts)} virtual RomFS mount(s) ready; nx_extract --serve is reading on demand')
+        except Exception as e:
+            self.close_romfs_containers()
+            raise BuildError(f'cannot mount NSP RomFS container: {type(e).__name__}: {e}') from e
+
+    def close_romfs_containers(self):
+        for root in getattr(self, 'romfs_mount_paths', []):
+            try: romfs.unmount(root)
+            except Exception as e: say(f'[RED] could not close RomFS mount {root}: {e}')
+        self.romfs_mount_paths = []
+        self.romfs_backends = []
+        if hasattr(self, 'env'): self.env.pop('DM_ROMFS_MOUNTS', None)
+        if hasattr(self, '_old_collect_nros'):
+            nsp.collect_nros = self._old_collect_nros
+            del self._old_collect_nros
+        if hasattr(self, '_old_nsp_romfs'):
+            nsp.romfs = self._old_nsp_romfs
+            del self._old_nsp_romfs
+
     def check_space(self):
         """Stop before extracting when the game folder's drive cannot hold the port: a build folder takes about 1 to 2 times the game files (NEO 7.0 GB of 6.8,
         Viractal 2.7 of 1.4), less what an earlier port left there, plus a margin; an NSZ / XCZ counts as decompressed, and once more for its NSP while it is extracted.
@@ -347,7 +421,12 @@ class Port:
         files = [dump] if dump is not None else [f for f in self.o.folder.iterdir() if f.is_file() and f.suffix.lower()[1:] in dumps.EXTS]
         game, temp = sum(dumps.size(f) for f in files), sum(dumps.size(f) for f in files if dumps.compressed(f))
         built = sum(f.stat().st_size for f in self.work.rglob('*') if f.is_file()) if self.work.is_dir() else 0
-        need, free = max(0, 2 * game + temp - built) + 2**30, shutil.disk_usage(self.o.folder).free
+        if self.o.romfs_container:
+            # Only compressed dumps need a second local copy; the RomFS itself is read on demand.
+            need = max(0, temp - built) + 2**30
+        else:
+            need = max(0, 2 * game + temp - built) + 2**30
+        free = shutil.disk_usage(self.o.folder).free
         if free < need: raise BuildError(f'not enough disk space on {self.o.folder.anchor}: the port needs about {need / 2**30:.1f} GB more, {free / 2**30:.1f} GB is free')
 
     def use_profile_dir(self, pdir, first):   # every tool finds the game's profile in pdir (game.py DM_GAMES_DIR; first: before dm/games)
@@ -386,25 +465,51 @@ class Port:
     def extract(self):
         o, g = self.o, self.g
         picks = nsp.pick_nsps(self.fam, self.have, self.versions)
+        source_picks = dict(picks)
         ex = self.work / 'extract'; ex.mkdir(parents=True, exist_ok=True)
-        need = sum(dumps.size(p) * (2 if dumps.compressed(p) else 1) for p in {p for b, u in picks.values() for p in (b, u) if p}) / 2**30 + 6
-        if nsp.free_gb(self.work) < need and not all((ex / v).exists() for v in self.versions): raise BuildError(f'less than {need:.0f} GB free on the volume of {self.work}')
-        # NSZ / XCZ: only what a stage will read is decompressed, all in one stage before nx_extract runs (a version nsp.extract reuses reads nothing)
-        fresh = lambda v: (ex / v / 'ExeFS/main').exists() and (ex / v / 'RomFS' / g.get('romfs_marker')).exists()   # nsp.extract's reuse test
+        selected = {p for b, u in picks.values() for p in (b, u) if p}
+        if o.romfs_container:
+            need = sum(dumps.size(p) for p in selected if dumps.compressed(p)) / 2**30 + 2
+        else:
+            need = sum(dumps.size(p) * (2 if dumps.compressed(p) else 1) for p in selected) / 2**30 + 6
+        if nsp.free_gb(self.work) < need and (o.romfs_container or not all((ex / v / 'ExeFS/main').exists() for v in self.versions)):
+            raise BuildError(f'less than {need:.0f} GB free on the volume of {self.work}')
+        # NSZ / XCZ: container mode also needs a seekable NSP for nx_extract --serve.
+        fresh = lambda v: (ex / v / 'ExeFS/main').exists() and (o.romfs_container or (ex / v / 'RomFS' / g.get('romfs_marker')).exists())
         zdlc = [p for _, _, p in self.fam['dlc'] if dumps.compressed(p)]
         # extract_aoc keys its reuse on the names, sizes and times of the NSPs it reads, decompressed ones here: with NSZ / XCZ DLC, porter keys it on those files instead
         dkey = nsp.fingerprint(sorted((t, p.name, p.stat().st_size, p.stat().st_mtime_ns) for t, _, p in self.fam['dlc']),
                                ('files', [NXNATIVE / 'dm/tools/nx_extract' / f for f in ('Program.cs', 'nx_extract.csproj')]))
         dkf = self.work / 'aoc.dumps.key'
         dlc_reused = bool(zdlc) and (self.work / 'aoc').is_dir() and nsp.reused(dkf, dkey) is not None
-        m = self.unpack([p for v in self.versions if not fresh(v) for p in picks[v] if p] + ([] if dlc_reused else zdlc)
-                        + ([self.fam['base']] if not dlc_reused and self.fam['base'] in zdlc else []))   # the merged dump is its DLC's source: extract_aoc compares its paths against the base's, so the base is decompressed too — even when every version's extraction is reused
+        m = self.unpack(([p for bu in picks.values() for p in bu if p] if o.romfs_container else
+                         [p for v in self.versions if not fresh(v) for p in picks[v] if p])
+                        + ([] if dlc_reused else zdlc)
+                        + ([self.fam['base']] if not dlc_reused and self.fam['base'] in zdlc else []))   # merged dump is also the update/DLC source
         picks = {v: tuple(m.get(p, p) if p else None for p in bu) for v, bu in picks.items()}
+        if o.romfs_container:
+            self.container_identity_paths = sorted({p for bu in source_picks.values() for p in bu if p}, key=lambda p: str(p))
+            self.container_keys = o.keys
+            self.container_key = self.romfs_container_identity(self.container_identity_paths)
+            keyfile = self.aw / 'romfs_container.key'
+            previous = keyfile.read_text(encoding='utf-8').strip() if keyfile.is_file() else ''
+            if previous != self.container_key:
+                say('[ROMFS container] source changed; rebuilding ExeFS/control extraction and invalidating RomFS-derived caches')
+                for ver in self.versions: nsp.rmtree(ex / ver)
         PROG.stage('build nx_extract')
         nx = nsp.build_nx_extract(NXNATIVE, self.work, self.logs, self.env)
         PROG.end()
-        self.dirs = {ver: nsp.extract(nx, o.keys, ex, ver, *picks[ver], None, self.logs, g) for ver in self.versions}
+        self.dirs = {ver: nsp.extract(nx, o.keys, ex, ver, *picks[ver], None, self.logs, g, exefs_only=o.romfs_container) for ver in self.versions}
         for d in self.dirs.values(): nsp.require_64bit(d / 'ExeFS', f'{g.get("name", g.id)} ({g.id})')
+        if o.romfs_container:
+            # An earlier directory-mode build may have left a full RomFS beside ExeFS; do not keep that duplicate.
+            for d in self.dirs.values():
+                nsp.rmtree(d / 'RomFS')
+                nsp.rmtree(d / 'RomFS.img')
+        if o.romfs_container:
+            self.container_base, self.container_update = picks[self.pkg_ver]
+            self.container_keys, self.container_exe = o.keys, Path(nx)
+            self.mount_romfs_containers(picks)
         bad = [] if self.derived else [f'{v}: {x}' for v in self.versions for x in nsp.build_mismatch(self.dirs[v], v, g)]
         if bad and self.provisional: raise BuildError(f'not the builds the provisional profile registers: {"; ".join(bad)}')
         if bad:
@@ -438,7 +543,7 @@ class Port:
             if zdlc: dkf.write_text(f'{dkey}\n')
             else: nsp.rmtree(dkf)
         self.sysdata = self.extract_sysdata(nx)
-        self.drop_unpacked()   # everything that reads them has run, and the shader stages that follow need the room
+        if not o.romfs_container: self.drop_unpacked()   # container readers remain live through the shader stages
         self.base = next((self.dirs[v] for v in self.versions if picks[v][1] is None), self.dirs[self.versions[0]])
         self.app_name = o.app_name or nacp.name(self.base / 'control.nacp') or self.g.get('name', self.g.id)
         self.display = nacp.version(self.game / 'control.nacp') or nacp.version(self.base / 'control.nacp') or '1.0'
@@ -579,6 +684,7 @@ class Port:
         aoc_dir = getattr(self, 'aoc', None)
         if not (aoc_dir and aoc_dir.is_dir()): aoc_dir = None
         def stage_tree(src_root, dst_root):
+            src_root = romfs.Path(src_root) if self.o.romfs_container else Path(src_root)
             dst_root.mkdir()
             big_files = []
             for src in sorted(src_root.rglob('*')):
@@ -588,23 +694,43 @@ class Port:
                 if size > self.GLSLC_SMALL and src.suffix.lower() not in ('.nro', '.nrr'):
                     big_files.append((rel.as_posix(), size)); continue
                 dest = dst_root / rel; dest.parent.mkdir(parents=True, exist_ok=True)
-                try: os.link(src, dest)
-                except OSError: shutil.copyfile(src, dest)
+                if self.o.romfs_container:
+                    with src.open('rb') as inp, dest.open('wb') as out: shutil.copyfileobj(inp, out, 1 << 20)
+                else:
+                    try: os.link(src, dest)
+                    except OSError: shutil.copyfile(src, dest)
             return big_files
         try:
-            dirs = f'{dev}/mods {dev}/RomFS {dev}/save {dev}/temp {dev}/capture' + (f' {dev}/aoc' if aoc_dir else '')
+            container_mode = bool(self.o.romfs_container)
+            dirs = f'{dev}/mods {dev}/save {dev}/temp {dev}/capture' + (f' {dev}/aoc' if aoc_dir else '')
+            if container_mode: dirs += f' {dev}/container'
+            else: dirs += f' {dev}/RomFS'
             adb.shell(f'mkdir -p {dirs}', retries=1)
             PROG.set(step='copying the game for its compiler')
             adb.push_file(host / 'dmhost', f'{dev}/dmhost')
             adb.push_tree(self.patched, f'{dev}/mods')
-            small = staging / 'romfs'
-            big = stage_tree(d / 'RomFS', small)
-            if any(small.iterdir()): adb.push_tree(small, f'{dev}/RomFS')
+            if container_mode:
+                remote_base = f'{dev}/container/base{Path(self.container_base).suffix.lower()}'
+                remote_keys = f'{dev}/container/prod.keys'
+                adb.push_file(self.container_base, remote_base)
+                if self.container_update:
+                    if Path(self.container_update).resolve() == Path(self.container_base).resolve():
+                        remote_update = remote_base
+                    else:
+                        remote_update = f'{dev}/container/update{Path(self.container_update).suffix.lower()}'
+                        adb.push_file(self.container_update, remote_update)
+                else: remote_update = None
+                adb.push_file(self.container_keys, remote_keys)
+                big = []
+            else:
+                small = staging / 'romfs'
+                big = stage_tree(d / 'RomFS', small)
+                if any(small.iterdir()): adb.push_tree(small, f'{dev}/RomFS')
             aoc_small = staging / 'aoc' if aoc_dir else None
             aoc_big = stage_tree(aoc_dir, aoc_small) if aoc_dir else []
             if aoc_small and any(aoc_small.iterdir()): adb.push_tree(aoc_small, f'{dev}/aoc')
             adb.push_file(self.g.table('shader_map.tsv'), f'{dev}/shader_map.tsv')
-            sparse_roots = [(f'{dev}/RomFS', big)]
+            sparse_roots = ([] if container_mode else [(f'{dev}/RomFS', big)])
             if aoc_dir: sparse_roots.append((f'{dev}/aoc', aoc_big))
             for remote_root, files in sparse_roots:
                 for start in range(0, len(files), 50):
@@ -612,10 +738,15 @@ class Port:
                                         f'truncate -s {size} {shlex.quote(f"{remote_root}/{rel}")}'
                                         for rel, size in files[start:start + 50]), retries=1)
             # No live save data, shader bundle or installed application environment enters this boot.
-            env_pairs = [('ROOT', '.'), ('ROMFS', 'RomFS')]
+            env_pairs = [('ROOT', '.')]
+            if not container_mode: env_pairs.append(('ROMFS', 'RomFS'))
             if aoc_dir: env_pairs.append(('AOC_DIR', 'aoc'))
             env_pairs += [('SAVE', 'save'), ('TEMP', 'temp'), ('GLSLC_CAPTURE', 'capture'), ('NVN_SHMAP', 'shader_map.tsv')]
             env = {f'DM_{key}': f'{dev}/{value}' for key, value in env_pairs}
+            if container_mode:
+                env['DM_ROMFS_CONTAINER'] = remote_base
+                env['DM_PROD_KEYS'] = remote_keys
+                if remote_update: env['DM_ROMFS_UPDATE'] = remote_update
             command = ' '.join(f'{k}={shlex.quote(v)}' for k, v in env.items())
             PROG.set(step='capturing run-time shaders')
             say(f'booting {self.app_name} on the Android device to capture its run-time shaders (up to {self.GLSLC_SECS} seconds)')
@@ -669,7 +800,6 @@ class Port:
         shader come back (DM_OODLE_JOB_BNSH), written as the split's decoded folder (shader_split.py gfpak_decoded, trpfs_decoded). Streaming the entries through an adb forward
         instead reset the connection whenever both directions were busy.
         → the split's environment"""
-        import mmap
         import struct
         PROG.set(step="the game's Oodle entries in a job file")
         tmp = self.work / 'tmp/oodle'; nsp.rmtree(tmp); tmp.mkdir(parents=True)
@@ -677,7 +807,7 @@ class Port:
         with open(job, 'wb') as jf:
             jf.write(b'DMOJ' + struct.pack('<I', 0))
             for v in self.versions:
-                rom = self.dirs[v] / 'RomFS'
+                rom = romfs.Path(self.dirs[v] / 'RomFS') if self.o.romfs_container else self.dirs[v] / 'RomFS'
                 for p in sorted(rom.rglob('*.gfpak')):
                     d = p.read_bytes()
                     if d[:8] != b'GFLXPACK': continue
@@ -688,7 +818,7 @@ class Port:
                 for p in sorted(rom.rglob('*.trpfs')):
                     if (packs := trinity.packs(str(p))) is None: continue
                     label = '/' + p.relative_to(rom).as_posix()
-                    with open(p, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
+                    with romfs.open(p, 'rb') as f, romfs.mmap.mmap(f.fileno(), 0, access=romfs.mmap.ACCESS_READ) as d:
                         for off, _, _ in packs:
                             for k, _, comp, n, st, sz in trinity.pack_files(d, off):
                                 if comp == 3: jf.write(struct.pack('<II', sz, n)); jf.write(d[st:st + sz]); recs.append((label, len(d), (off, k)))
@@ -731,7 +861,9 @@ class Port:
     # ---- legacy Unreal paks (version 4) with LZ5 blocks, decoded by the game's own LZ5 on the device (DRAGON QUEST XI S; the Mac serves the split through its host, DM_OODLE_SERVE) ----
     UEL_JOB = 1 << 30   # compressed bytes per job: the device holds one job and its output at a time
     def uel_stamp(self, v):
-        return ''.join(f'{p.relative_to(self.dirs[v] / "RomFS").as_posix()}\t{p.stat().st_size}\n' for p in sorted((self.dirs[v] / 'RomFS').rglob('*.pak')))
+        root = romfs.Path(self.dirs[v] / 'RomFS') if self.o.romfs_container else self.dirs[v] / 'RomFS'
+        stamp = ''.join(f'{p.relative_to(root).as_posix()}\t{p.stat().st_size}\n' for p in sorted(root.rglob('*.pak')))
+        return stamp + (getattr(self, 'container_key', '') + '\n' if self.o.romfs_container else '')
     def uel_stamp_ok(self, v):
         st = self.dirs[v] / 'ue_legacy/stamp'
         return st.is_file() and st.read_text(encoding='utf-8') == self.uel_stamp(v)
@@ -746,9 +878,9 @@ class Port:
         PROG.add(1); PROG.stage('UE legacy decode', step='the LZ5 files of the paks')
         tmp = self.work / 'tmp/uel'; kept_all = files_all = 0
         for v in todo:
-            rom = self.dirs[v] / 'RomFS'; out = self.dirs[v] / 'ue_legacy.partial'; nsp.rmtree(out); out.mkdir(parents=True)
+            rom = romfs.Path(self.dirs[v] / 'RomFS') if self.o.romfs_container else self.dirs[v] / 'RomFS'; out = self.dirs[v] / 'ue_legacy.partial'; nsp.rmtree(out); out.mkdir(parents=True)
             for pp in sorted(rom.rglob('*.pak')):
-                with open(pp, 'rb') as f: ver = uepak.pak_version(f)
+                with romfs.open(pp, 'rb') as f: ver = uepak.pak_version(f)
                 if ver != 4: continue
                 pk = uepak.Pak(str(pp)); rel = pp.relative_to(rom).as_posix()
                 names = [n for n, e in pk.files.items() if e['method'] == 'LZ5']
@@ -1078,8 +1210,31 @@ class Port:
         if self.o.shared_font:   # the host serves it for every shared-font type but the button icons (hle_sdk16.c font_get)
             font_env, font_files = font_env + [f'DM_SHARED_FONT={datapack.files_folder(self.package)}/standard.ttf'], {**font_files, 'standard.ttf': self.o.shared_font}
         dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
-        romfs, zenv = self.game / 'RomFS', []
-        if self.ap.romfs_zstd and romfs.is_dir():   # android.tsv romfs zstd: packed copies of the files that compress, made once into the build folder; the rest stay links to the extraction
+        romfs, zenv, container_files, container_meta = self.game / 'RomFS', [], {}, None
+        if self.o.romfs_container:
+            base = Path(self.container_base)
+            base_name = f'container/base{base.suffix.lower()}'
+            container_files[base_name] = base
+            if self.container_update:
+                if Path(self.container_update).resolve() == base.resolve():
+                    update_name = base_name
+                else:
+                    update = Path(self.container_update)
+                    update_name = f'container/update{update.suffix.lower()}'
+                    container_files[update_name] = update
+            else: update_name = None
+            keys_name = 'container/prod.keys'
+            container_files[keys_name] = self.container_keys
+            merged_container = bool(self.container_update and Path(self.container_update).resolve() == base.resolve())
+            container_meta = dict(base=base_name, update=update_name, keys=keys_name, merged=merged_container,
+                                  base_name=base.name, update_name=Path(self.container_update).name if self.container_update else None,
+                                  source_key=self.container_key)
+            romfs = None
+            zenv = [f'DM_ROMFS_CONTAINER={datapack.files_folder(self.package)}/{base_name}',
+                    f'DM_PROD_KEYS={datapack.files_folder(self.package)}/{keys_name}']
+            if update_name: zenv.append(f'DM_ROMFS_UPDATE={datapack.files_folder(self.package)}/{update_name}')
+            say(f'[ROMFS container] data pack will carry {len(container_files)} container/key file(s); no RomFS directory')
+        if self.ap.romfs_zstd and romfs and romfs.is_dir():   # android.tsv romfs zstd: packed copies of the files that compress, made once into the build folder; the rest stay links to the extraction
             PROG.set(step='compressing the RomFS', done=0, total=1, unit='B')
             nf, npk, raw, out = romfs_pack.pack_tree(romfs, self.aw / 'romfs_zstd' / self.pkg_ver, self.o.jobs, progress=lambda d, t: PROG.set(step='compressing the RomFS', done=d, total=t, unit='B'))
             say(f'RomFS compressed: {npk:,} of {nf:,} files packed, {raw / 2**30:.1f} GB → {out / 2**30:.1f} GB on the device')
@@ -1088,7 +1243,8 @@ class Port:
                              aoc=self.aoc, sysdata=self.sysdata, language=self.lang, languages=self.languages, package=self.package, env=self.fps_env + font_env + zenv + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
                              + (['DM_MENU_BUTTON=0'] if self.o.no_menu_button else [])
                              + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
-                             files={**self.fps_files, **font_files}, profile_h=getattr(self, 'profile_h', None),
+                             files={**self.fps_files, **font_files, **container_files}, romfs_container=container_meta,
+                             profile_h=getattr(self, 'profile_h', None),
                              progress=lambda what: PROG.set(step=f'linking {what}'))
         self.data_path = dst; self.result['data'] = str(dst)
         PROG.end(f'{man["files"]:,} files, {man["bytes"] / 2**30:.1f} GB')

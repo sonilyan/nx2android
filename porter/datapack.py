@@ -18,7 +18,7 @@ from porter.upstream import settings_registry
 
 MANIFEST = 'nx2a-data.json'
 KEEP_ON_DEVICE = ('settings.txt',)          # the player's choices win over the pack's defaults
-OWNED = ('mods', 'RomFS', 'aoc', 'sysdata')            # folders the pack owns on the device: files there that the pack lacks are stale (an older version's) and removed
+OWNED = ('mods', 'RomFS', 'aoc', 'sysdata', 'container')            # folders the pack owns on the device: files there that the pack lacks are stale (an older version's) and removed
 ROMFS = 'RomFS'
 
 
@@ -60,7 +60,7 @@ def romfs_sizes(d):   # {path in the RomFS: size} of the pack in d, '/'-separate
     return {p.relative_to(r).as_posix(): p.stat().st_size for p in r.rglob('*') if p.is_file()} if r.is_dir() else {}
 
 
-def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, sysdata=None, language='en-US', languages=(), package=None, env=(), settings=None, files=None, profile_h=None, progress=None):
+def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, sysdata=None, language='en-US', languages=(), package=None, env=(), settings=None, files=None, romfs_container=None, profile_h=None, progress=None):
     """Write the pack to dst (replacing it). profile: the AndroidProfile; package: the app's, when not the profile's; env: more env.txt rows, after the profile's; settings: settings.txt values over the profile's;
     languages: supported Switch language codes from the NACP when language is 'system'; files: {name in the pack: source} (fpslock.tsv, the button-icon font);
     profile_h: sha256 of the game_profile.h the host was built with (porter host). Returns the manifest"""
@@ -74,7 +74,13 @@ def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, 
         if progress: progress(what)
         dn, db = link_tree(src, tmp / sub); n += dn; b += db
     if shaders: link_or_copy(shaders, tmp / 'shaders.dmsv'); n += 1; b += shaders.stat().st_size   # none for an OpenGL ES game
-    for name, src in (files or {}).items(): shutil.copyfile(src, tmp / name); n += 1; b += Path(src).stat().st_size
+    for name, src in (files or {}).items():
+        dst_file = tmp / name
+        if name.startswith('container/'): link_or_copy(Path(src), dst_file)
+        else:
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst_file)
+        n += 1; b += Path(src).stat().st_size
     rows = [f'# Written by nx2android\'s porter for {profile.name} ({profile.id}); KEY=VALUE per line, read by the app at launch',
             f'DM_LANG={language}']
     if language == 'system' and languages:
@@ -89,6 +95,12 @@ def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, 
                files=n, bytes=b, dlc=sorted(int(p.name) for p in aoc.iterdir() if p.is_dir() and p.name.isdigit()) if aoc else [],
                sysdata=sorted(p.name for p in sysdata.iterdir() if p.is_dir()) if sysdata else [], made=time.strftime('%Y-%m-%d %H:%M:%S'))
     if profile_h: man['profile_h'] = profile_h
+    if romfs_container:
+        man['romfs_container'] = dict(romfs_container)
+        man['romfs_container']['files'] = {
+            name: {'bytes': (tmp / name).stat().st_size}
+            for name in (romfs_container.get('base'), romfs_container.get('update'), romfs_container.get('keys')) if name
+        }
     if parts := {p: k for p in SEEDABLE if (k := part_key(tmp, p))}: man['parts'] = parts   # the content keys install's seeding compares
     (tmp / MANIFEST).write_text(json.dumps(man, indent=2), encoding='utf-8')
     if dst.exists(): shutil.rmtree(dst)

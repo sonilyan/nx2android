@@ -54,6 +54,7 @@ def _parser():
                          '"AllocateAddressRegion refused (0x1803)" before it crashes; it uses no memory (default: 8 for a game version the profile was not '
                          'brought up on, none for one it was)')
     _romfs_at(po, 'with --install: ')
+    po.add_argument('--romfs-container', action='store_true', help='read RomFS directly from the selected NSP/XCI instead of extracting its files; the data pack carries the container and prod.keys')
     po.add_argument('--jobs', type=int, default=os.cpu_count() or 8)
     po.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'), help='json: one JSON event per line, for the GUI')
     ins = sub.add_parser('install', help='install a port made earlier'); ins.add_argument('data', help='the data pack folder (<App>-data)'); ins.add_argument('--apk', help='the APK (default: <App>.apk beside the pack)')
@@ -167,11 +168,14 @@ def cmd_port(a):
         env = os.environ.get('NX2A_VERCODE_OFFSET', '').strip() or '0'
         try: offset = int(env)
         except ValueError: print(f'NX2A_VERCODE_OFFSET is not a number: {env}', file=sys.stderr); return 2
+    if a.romfs_container and (a.romfs_at is not None or a.romfs_push):
+        print('--romfs-container cannot be combined with --romfs-at or --romfs-push', file=sys.stderr); return 2
     if (a.romfs_at is not None or a.romfs_push) and not a.install: print('--romfs-at and --romfs-push are install options: add --install, or run porter install after the port', file=sys.stderr); return 2
     from porter import install
     from porter.upstream import BuildError
-    try: install.romfs_target(a.romfs_at)   # a folder the app cannot read fails now, not after the shaders
-    except BuildError as e: print(e, file=sys.stderr); return 2
+    if not a.romfs_container:
+        try: install.romfs_target(a.romfs_at)   # a folder the app cannot read fails now, not after the shaders
+        except BuildError as e: print(e, file=sys.stderr); return 2
     opts = pipeline.Options.from_args(a, vercode_offset=offset)   # every other field from the argument of its name
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
 

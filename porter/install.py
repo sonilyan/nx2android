@@ -169,6 +169,19 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
     apk, data = Path(apk), Path(data)
     man = datapack.read_manifest(data)
     if not man: raise BuildError(f'not a data pack (no {datapack.MANIFEST}): {data}')
+    container = man.get('romfs_container')
+    if container is not None and not isinstance(container, dict):
+        raise BuildError(f'{datapack.MANIFEST}: romfs_container metadata is not an object')
+    if container:
+        if romfs_at is not None or romfs_push:
+            raise BuildError('--romfs-at / --romfs-push cannot be combined with a data pack that reads RomFS from an NSP/XCI container')
+        for part in ('base', 'keys'):
+            rel = container.get(part)
+            if not isinstance(rel, str) or not rel or Path(rel).is_absolute() or '..' in Path(rel).parts or not (data / rel).is_file():
+                raise BuildError(f'the data pack is missing its RomFS container {part} file: {rel!r}')
+        update = container.get('update')
+        if update and (Path(update).is_absolute() or '..' in Path(update).parts or not (data / update).is_file()):
+            raise BuildError(f'the data pack is missing its RomFS container update file: {update!r}')
     if not apk.is_file(): raise BuildError(f'no APK: {apk}')
     if not adb_exe: raise BuildError('adb not found: install Android platform-tools, or set its path with `porter config adb <path>`')
     files = datapack.files_folder(man['package'])
@@ -184,6 +197,11 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
         dev = adb.pick(); lock = adb.hold(paths.user_dir())   # one install per device at a time: released in the finally below
         model = adb.prop('ro.product.model')
         say(f'device: {model or dev} ({dev}), GPU {adb.gpu() or "unknown"}')
+        if container:
+            source = f'[ROMFS container] app will read {container.get("base_name") or container["base"]}'
+            if container.get('merged'): source += ' (merged base/update container)'
+            elif container.get('update'): source += f' + {container.get("update_name") or container["update"]}'
+            say(source + f'; prod.keys is stored separately ({container["keys"]})')
         if 'bcn' in man.get('requires', []):   # the profile's requires: BC-compressed textures
             bc = adb.bc_textures()
             if bc is False: raise BuildError(f'{man["name"]} needs BC-compressed textures, which this device\'s GPU ({adb.gpu()}) cannot read')
@@ -199,7 +217,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
         if sd_dir: was = posixpath.normpath(was)
         if romfs_at == NO_SD:
             romfs_at = APP if sd_dir else None
-        if romfs_at is None and was:
+        if romfs_at is None and was and not container:
             target = romfs_target(was, files)
             if packed and target and not sd_dir: raise BuildError(f'the app reads its RomFS from {target} (an earlier install\'s --romfs-at). ' + PACKED_ELSEWHERE)
             if target: say(f'the app reads its RomFS from {target} (an earlier install\'s --romfs-at; --romfs-at app moves it into its files folder)')

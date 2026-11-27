@@ -484,7 +484,7 @@ class Port:
         dlc_reused = bool(zdlc) and (self.work / 'aoc').is_dir() and nsp.reused(dkf, dkey) is not None
         m = self.unpack(([p for bu in picks.values() for p in bu if p] if o.romfs_container else
                          [p for v in self.versions if not fresh(v) for p in picks[v] if p])
-                        + ([] if dlc_reused else zdlc)
+                        + ([] if dlc_reused and not o.romfs_container else zdlc)
                         + ([self.fam['base']] if not dlc_reused and self.fam['base'] in zdlc else []))   # merged dump is also the update/DLC source
         picks = {v: tuple(m.get(p, p) if p else None for p in bu) for v, bu in picks.items()}
         if o.romfs_container:
@@ -542,6 +542,27 @@ class Port:
                                            dlc=[(t, v, m.get(p, p)) for t, v, p in self.fam['dlc']]), self.logs)
             if zdlc: dkf.write_text(f'{dkey}\n')
             else: nsp.rmtree(dkf)
+        # Keep the extracted DLC tree for shader analysis, but pack independent
+        # DLC NSPs directly when the RomFS is carried as a container.
+        self.aoc_files = None
+        if o.romfs_container:
+            best = {}
+            for tid, ver, p in self.fam['dlc']:
+                key = (ver or 0, p.stat().st_size)
+                if tid not in best or key > best[tid][0]:
+                    best[tid] = (key, p)
+
+            self.aoc_files = {}
+            for tid, (_, p) in sorted(best.items()):
+                # DLC already integrated in the base container is read by the Host.
+                if p == self.fam['base']:
+                    continue
+
+                idx = tid - self.app - 0x1000
+                source = m.get(p, p)
+                if source.suffix.lower() != '.nsp':
+                    raise BuildError(f'DLC {tid:016X}: expected an NSP after unpacking, got {source.name}')
+                self.aoc_files[f'aoc/{idx}.nsp'] = source
         self.sysdata = self.extract_sysdata(nx)
         if not o.romfs_container: self.drop_unpacked()   # container readers remain live through the shader stages
         self.base = next((self.dirs[v] for v in self.versions if picks[v][1] is None), self.dirs[self.versions[0]])

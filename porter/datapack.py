@@ -1,7 +1,9 @@
+
 # The data pack: everything the app reads from its files folder on the device (/sdcard/Android/data/<package>/files, front_android.c), as a folder beside the APK:
 #   mods/          the rewritten code modules (patch_nso.py's outputs)
 #   RomFS/         the game's files (the packed version's merged RomFS)
-#   aoc/<index>/   the DLC the player has
+#   aoc/<index>/   the DLC the player has (directory format)
+#   aoc/<index>.nsp  the DLC the player has (NSP format)
 #   sysdata/<title ID>/  system data from the player's firmware dump that the game reads (android.tsv sysdata, porter --firmware; env.txt's DM_SYSDATA)
 #   shaders.dmsv   the Vulkan shaders (dm/android/tools/shader_vk.py)
 #   nintendo_ext.ttf  the button-icon font, the stand-in for the Nintendo extension shared font (dm/tools/make_ext_font.py; env.txt's DM_SHARED_FONT_EXT)
@@ -60,39 +62,69 @@ def romfs_sizes(d):   # {path in the RomFS: size} of the pack in d, '/'-separate
     return {p.relative_to(r).as_posix(): p.stat().st_size for p in r.rglob('*') if p.is_file()} if r.is_dir() else {}
 
 
-def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, sysdata=None, language='en-US', languages=(), package=None, env=(), settings=None, files=None, romfs_container=None, profile_h=None, progress=None):
+def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, aoc_files=None, sysdata=None, language='en-US', languages=(), package=None, env=(), settings=None, files=None, romfs_container=None, profile_h=None, progress=None):
     """Write the pack to dst (replacing it). profile: the AndroidProfile; package: the app's, when not the profile's; env: more env.txt rows, after the profile's; settings: settings.txt values over the profile's;
     languages: supported Switch language codes from the NACP when language is 'system'; files: {name in the pack: source} (fpslock.tsv, the button-icon font);
-    profile_h: sha256 of the game_profile.h the host was built with (porter host). Returns the manifest"""
+    aoc_files: {name in the pack: source} for individually packed DLC NSPs; profile_h: sha256 of the game_profile.h the host was built with (porter host).
+    Returns the manifest"""
     package = package or profile.package
     tmp = dst.with_name(dst.name + '.partial')
     if tmp.exists(): shutil.rmtree(tmp)
     tmp.mkdir(parents=True)
     n = b = 0
-    for what, src, sub in (('the rewritten modules', patched, 'mods'), ('the RomFS', romfs, 'RomFS'), ('the DLC', aoc, 'aoc'), ('the system data', sysdata, 'sysdata')):
+    for what, src, sub in (('the rewritten modules', patched, 'mods'), ('the RomFS', romfs, 'RomFS'), ('the system data', sysdata, 'sysdata')):
         if not src: continue
         if progress: progress(what)
         dn, db = link_tree(src, tmp / sub); n += dn; b += db
+
+    # Keep the original directory-based DLC packing path when aoc_files is None.
+    # When aoc_files is supplied, pack the individual NSP files instead.
+    if aoc and aoc_files is None:
+        if progress: progress('the DLC')
+        dn, db = link_tree(aoc, tmp / 'aoc'); n += dn; b += db
+
     if shaders: link_or_copy(shaders, tmp / 'shaders.dmsv'); n += 1; b += shaders.stat().st_size   # none for an OpenGL ES game
     for name, src in (files or {}).items():
         dst_file = tmp / name
-        if name.startswith('container/'): link_or_copy(Path(src), dst_file)
+        if name.startswith(('container/', 'aoc/')):
+            link_or_copy(Path(src), dst_file)
         else:
             dst_file.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src, dst_file)
         n += 1; b += Path(src).stat().st_size
+
+    # Individual DLC NSPs: aoc/<index>.nsp
+    for name, src in (aoc_files or {}).items():
+        link_or_copy(Path(src), tmp / name)
+        n += 1
+        b += Path(src).stat().st_size
+
     rows = [f'# Written by nx2android\'s porter for {profile.name} ({profile.id}); KEY=VALUE per line, read by the app at launch',
             f'DM_LANG={language}']
     if language == 'system' and languages:
         rows.append('DM_LANG_SUPPORTED=' + ' '.join(languages))
-    if aoc: rows.append(f'DM_AOC_DIR={files_folder(package)}/aoc')
+    if aoc or aoc_files: rows.append(f'DM_AOC_DIR={files_folder(package)}/aoc')
     if sysdata: rows.append(f'DM_SYSDATA={files_folder(package)}/sysdata')
     rows += profile.env + list(env)
     if bad := settings_registry.check_env(rows, ('profile', 'porter'), 'env.txt '): raise ValueError('; '.join(bad))   # nxnative/dm/settings.tsv
     (tmp / 'env.txt').write_text('\n'.join(rows) + '\n', encoding='utf-8', newline='\n')
     if sets := {**profile.settings, **(settings or {})}: (tmp / 'settings.txt').write_text(''.join(f'{k}={v}\n' for k, v in sets.items()), encoding='utf-8', newline='\n')
+
+    # The manifest records DLC indices from both directory-based DLC and NSP-based DLC.
+    dlc_indices = (
+        {int(p.name) for p in aoc.iterdir() if p.is_dir() and p.name.isdigit()}
+        if aoc else set()
+    )
+    dlc_indices.update(
+        int(Path(name).stem)
+        for name in (aoc_files or {})
+        if Path(name).parent == Path('aoc')
+        and Path(name).suffix.lower() == '.nsp'
+        and Path(name).stem.isdigit()
+    )
+
     man = dict(title_id=profile.id, name=profile.name, package=package, version=version, display=display, language=language, requires=profile.requires,
-               files=n, bytes=b, dlc=sorted(int(p.name) for p in aoc.iterdir() if p.is_dir() and p.name.isdigit()) if aoc else [],
+               files=n, bytes=b, dlc=sorted(dlc_indices),
                sysdata=sorted(p.name for p in sysdata.iterdir() if p.is_dir()) if sysdata else [], made=time.strftime('%Y-%m-%d %H:%M:%S'))
     if profile_h: man['profile_h'] = profile_h
     if romfs_container:

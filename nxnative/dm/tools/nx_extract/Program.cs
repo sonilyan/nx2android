@@ -69,16 +69,27 @@ static class P {
         bool exefsOnly = Array.IndexOf(a, "--exefs") >= 0; a = Array.FindAll(a, s => s != "--exefs");
         g_allow = Array.IndexOf(a, "--allow-damaged") >= 0; a = Array.FindAll(a, s => s != "--allow-damaged");
         string verArg = null;   // --version N (--merged): extract exactly the update whose content meta says version N; 0 = the base game alone. Without it, the newest patch
+        string dlcArg = null;   // --dlc <title ID hex> (--serve): read this DLC's Data NCA instead of the game's Program NCA
         var kept = new List<string>(a.Length);
         for (int i = 0; i < a.Length; i++) {
             if (a[i] == "--version") { if (i + 1 >= a.Length) { Console.Error.WriteLine("[RED] --version needs a number"); return 2; } verArg = a[i + 1]; i++; continue; }
+            if (a[i] == "--dlc") { if (i + 1 >= a.Length) { Console.Error.WriteLine("[RED] --dlc needs a title ID in hex"); return 2; } dlcArg = a[i + 1]; i++; continue; }
             kept.Add(a[i]);
         }
         a = kept.ToArray();
-        if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--manifest|--exefs] [--allow-damaged]\n       nx_extract <prod.keys> --merged <dump> <out dir> [--version N] [base RomFS dir] [--manifest|--exefs] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir>\n       nx_extract <prod.keys> --aoc <dump> <out dir> <DLC title id hex>\n       nx_extract <prod.keys> --sysdata <firmware dir> <title id> <out dir>\n       nx_extract <prod.keys> --serve <base.nsp|base.xci> <update.nsp|->"); return 2; }
+        if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--manifest|--exefs] [--allow-damaged]\n       nx_extract <prod.keys> --merged <dump> <out dir> [--version N] [base RomFS dir] [--manifest|--exefs] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir>\n       nx_extract <prod.keys> --aoc <dump> <out dir> <DLC title id hex>\n       nx_extract <prod.keys> --sysdata <firmware dir> <title id> <out dir>\n       nx_extract <prod.keys> --serve <base.nsp|base.xci> <update.nsp|-> [--dlc <title ID hex>]"); return 2; }
         KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
+        if (dlcArg != null && a[1] != "--serve") { Console.Error.WriteLine("[RED] --dlc is only valid with --serve"); return 2; }
         if (a[1] == "--aoc") return Aoc(ks, a[2], a[3], a.Length > 4 ? a[4] : null);
-        if (a[1] == "--serve") { if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> --serve <base.nsp|base.xci> <update.nsp|->"); return 2; } return Serve(ks, a[2], a[3] == "-" ? null : a[3]); }
+        if (a[1] == "--serve") {
+            if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> --serve <base.nsp|base.xci> <update.nsp|-> [--dlc <title ID hex>]"); return 2; }
+            ulong? dlcTitleId = null;
+            if (dlcArg != null) {
+                try { dlcTitleId = Convert.ToUInt64(dlcArg, 16); }
+                catch (Exception) { Console.Error.WriteLine($"[RED] --dlc title ID must be a hex number: {dlcArg}"); return 2; }
+            }
+            return Serve(ks, a[2], a[3] == "-" ? null : a[3], dlcTitleId);
+        }
         if (a[1] == "--sysdata") { if (a.Length < 5) { Console.Error.WriteLine("usage: nx_extract <prod.keys> --sysdata <firmware dir> <title id> <out dir>"); return 2; } return SysData(ks, a[2], Convert.ToUInt64(a[3], 16), a[4]); }
         if (a[1] == "--merged") return Merged(ks, a[2], a[3], a.Length > 4 ? a[4] : null, manifest, verArg, exefsOnly);
         var basePkg = OpenNsp(ks, a[1]); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
@@ -391,23 +402,45 @@ static class P {
     // --serve: the merged RomFS of a container as a read-only file system the build tools read through (dm/tools/romfs.py): requests on stdin, answers on stdout,
 //   STAT / LIST / OPEN / READ / CLOSE. LibHac layers the update's BKTR over the base exactly as the extraction does, so a container build reads the player's own
     //   file without extracting it, and no C compiler is needed on the machine that ports (dotnet is part of the toolchain already).
-    //   nx_extract <prod.keys> --serve <base.nsp|base.xci> <update.nsp|-> (the base alone for a container without an update; the base again for an integrated one)
-    static int Serve(KeySet ks, string basePath, string updPath) {
+    //   nx_extract <prod.keys> --serve <base.nsp|base.xci> <update.nsp|-> [--dlc <title ID hex>]
+    //   With --dlc, the selected title's Data/PublicData NCA is served instead of the game's Program NCA.
+    static int Serve(KeySet ks, string basePath, string updPath, ulong? dlcTitleId = null) {
         var basePkg = OpenNsp(ks, basePath);
         var updPkg = updPath == null ? null : (updPath == basePath ? basePkg : OpenNsp(ks, updPath));
-        Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the base NSP");
-        Nca updProg;
-        if (updPkg == null) updProg = null;
-        else if (updPkg != basePkg) updProg = Pick(updPkg, NcaContentType.Program, baseProg.Header.TitleId);   // the update NSP's Program NCA, whatever program index it is
-        else {   // an integrated image: its newest Patch content meta names the Program NCA the console runs; the base game's and the update's share a title ID, so Pick would take either
-            Cnmt patch = Cnmts(basePkg).Where(m => m.Type == ContentMetaType.Patch).OrderByDescending(m => m.TitleVersion.Version).FirstOrDefault();
-            NcaEntry e = patch == null ? null : basePkg.FirstOrDefault(x => Path.GetFileNameWithoutExtension(x.Name).Equals(Convert.ToHexString(EntryOf(patch, LibHac.Ncm.ContentType.Program, basePkg)?.NcaId ?? Array.Empty<byte>()), StringComparison.OrdinalIgnoreCase));
-            if (patch != null && e == null) throw new Exception($"the update's content meta ({patch.TitleId:x16} v{patch.TitleVersion.Version}) lists a program NCA that is not in {Path.GetFileName(basePath)}");
-            updProg = e?.Nca;
+        IStorage storage;
+        if (dlcTitleId != null) {
+            var packages = updPkg == null || updPkg == basePkg ? new[] { basePkg } : new[] { basePkg, updPkg };
+            var candidates = packages.SelectMany(pkg => pkg).Select(entry => entry.Nca)
+                .Where(n => n.Header.TitleId == dlcTitleId &&
+                            (n.Header.ContentType == NcaContentType.PublicData || n.Header.ContentType == NcaContentType.Data)).ToList();
+            Nca baseDlc = candidates.FirstOrDefault(n => n.Header.ContentType == NcaContentType.PublicData && !IsPatch(n))
+                       ?? candidates.FirstOrDefault(n => n.Header.ContentType == NcaContentType.Data && !IsPatch(n));
+            if (baseDlc == null) {
+                bool hasPatch = candidates.Any(IsPatch);
+                throw new Exception(hasPatch
+                    ? $"DLC {dlcTitleId:x16} has a patch Data NCA but no base Data NCA in {Path.GetFileName(basePath)}"
+                    : $"no Data/PublicData NCA for DLC {dlcTitleId:x16} in {Path.GetFileName(basePath)}");
+            }
+            Nca patchDlc = candidates.LastOrDefault(n => n.Header.ContentType == baseDlc.Header.ContentType && IsPatch(n));
+            Console.Error.WriteLine($"[ROMFS container] DLC {dlcTitleId:x16}" + (patchDlc != null ? " (base + patch)" : " (base)"));
+            storage = patchDlc != null
+                ? baseDlc.OpenStorageWithPatch(patchDlc, NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid)
+                : baseDlc.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid);
+        } else {
+            Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the base NSP");
+            Nca updProg;
+            if (updPkg == null) updProg = null;
+            else if (updPkg != basePkg) updProg = Pick(updPkg, NcaContentType.Program, baseProg.Header.TitleId);   // the update NSP's Program NCA, whatever program index it is
+            else {   // an integrated image: its newest Patch content meta names the Program NCA the console runs; the base game's and the update's share a title ID, so Pick would take either
+                Cnmt patch = Cnmts(basePkg).Where(m => m.Type == ContentMetaType.Patch).OrderByDescending(m => m.TitleVersion.Version).FirstOrDefault();
+                NcaEntry e = patch == null ? null : basePkg.FirstOrDefault(x => Path.GetFileNameWithoutExtension(x.Name).Equals(Convert.ToHexString(EntryOf(patch, LibHac.Ncm.ContentType.Program, basePkg)?.NcaId ?? Array.Empty<byte>()), StringComparison.OrdinalIgnoreCase));
+                if (patch != null && e == null) throw new Exception($"the update's content meta ({patch.TitleId:x16} v{patch.TitleVersion.Version}) lists a program NCA that is not in {Path.GetFileName(basePath)}");
+                updProg = e?.Nca;
+            }
+            if (updProg == baseProg) updProg = null;
+            storage = updProg != null ? baseProg.OpenStorageWithPatch(updProg, NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid)
+                                      : baseProg.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid);
         }
-        if (updProg == baseProg) updProg = null;
-        IStorage storage = updProg != null ? baseProg.OpenStorageWithPatch(updProg, NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid)
-                                           : baseProg.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid);
         IFileSystem fs = new RomFsFileSystem(storage);
         // The whole tree once: EnumerateEntries' pattern matching answers only the root reliably, and the tools list, stat and read every entry anyway
         var files = new Dictionary<string, long>(StringComparer.Ordinal);

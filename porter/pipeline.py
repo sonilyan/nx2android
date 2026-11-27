@@ -359,7 +359,7 @@ class Port:
             identity.append((str(Path(f).resolve()), st.st_size, st.st_mtime_ns, st.st_ctime_ns, getattr(st, 'st_ino', 0)))
         return hashlib.sha256(json.dumps(identity, separators=(',', ':')).encode()).hexdigest()
 
-    def mount_romfs_containers(self, picks):
+    def mount_romfs_containers(self, picks, unpacked, dlc_best):
         """Mount every shader-version RomFS as a read-only view of its source NSP/XCI; no game files are extracted."""
         self.romfs_mount_paths, self.romfs_backends = [], []
         self._old_nsp_romfs = getattr(nsp, 'romfs', None)
@@ -383,6 +383,31 @@ class Port:
                                    keys=str(self.container_keys), exe=str(self.container_exe)))
                 say(f'[ROMFS container] {ver}: mounted {base.name}' + (f' + {update.name}' if update and update != base else
                      (' (merged base/update container)' if update == base else ' (base game only)')))
+            # DLC RomFS views share the same read protocol, selected by their full title ID.
+            self.aoc = self.work / 'aoc'
+            nsp.rmtree(self.aoc)
+            self.aoc.mkdir(parents=True, exist_ok=True)
+            indices = []
+            for tid, (_, original) in sorted(dlc_best.items()):
+                idx = tid - self.app - 0x1000
+                if idx < 0: raise BuildError(f"DLC {tid:016X}: title ID is below the application's AOC range")
+                source = unpacked.get(original, original)
+                if not source.is_file(): raise BuildError(f'DLC {tid:016X}: container does not exist: {source}')
+                root = self.aoc / str(idx)
+                root.mkdir(parents=True, exist_ok=True)
+                backend = romfs.Container(str(source), None, str(self.container_keys), str(self.container_exe), dlc_title_id=tid)
+                romfs.mount(root, backend)
+                self.romfs_mount_paths.append(root)
+                self.romfs_backends.append(backend)
+                indices.append(str(idx))
+                mounts.append(dict(path=str(root), base=str(source), update=None, keys=str(self.container_keys),
+                                   exe=str(self.container_exe), dlc_title_id=f'{tid:016x}'))
+                say(f'[AOC container] DLC {tid:016X}: mounted {source.name} at aoc/{idx}')
+            aoc_backend = romfs.AocRoot(str(self.aoc), indices)
+            romfs.mount(self.aoc, aoc_backend)
+            self.romfs_mount_paths.append(self.aoc)
+            self.romfs_backends.append(aoc_backend)
+            mounts.append(dict(kind='aoc_root', path=str(self.aoc), indices=indices))
             self.env['DM_ROMFS_MOUNTS'] = json.dumps(mounts, ensure_ascii=False)
             keyfile = self.aw / 'romfs_container.key'
             previous = keyfile.read_text(encoding='utf-8').strip() if keyfile.is_file() else ''
@@ -395,7 +420,7 @@ class Port:
                     for name in ('ue_shaders', 'ue_legacy', 'glslc_capture'):
                         nsp.rmtree(d / name)
                 keyfile.write_text(self.container_key + '\n', encoding='utf-8')
-            say(f'[ROMFS container] {len(mounts)} virtual RomFS mount(s) ready; nx_extract --serve is reading on demand')
+            say(f'[ROMFS container] {len(mounts)} virtual mount(s) ready (including {len(indices)} DLC); nx_extract --serve is reading on demand')
         except Exception as e:
             self.close_romfs_containers()
             raise BuildError(f'cannot mount NSP RomFS container: {type(e).__name__}: {e}') from e
@@ -488,8 +513,14 @@ class Port:
                         + ([] if dlc_reused and not o.romfs_container else zdlc)
                         + ([self.fam['base']] if not dlc_reused and self.fam['base'] in zdlc else []))   # merged dump is also the update/DLC source
         picks = {v: tuple(m.get(p, p) if p else None for p in bu) for v, bu in picks.items()}
+        dlc_best = {}
+        for tid, ver, p in self.fam['dlc']:
+            key = (ver or 0, p.stat().st_size)
+            if tid not in dlc_best or key > dlc_best[tid][0]:
+                dlc_best[tid] = (key, p)
         if o.romfs_container:
-            self.container_identity_paths = sorted({p for bu in source_picks.values() for p in bu if p}, key=lambda p: str(p))
+            self.container_identity_paths = sorted({p for bu in source_picks.values() for p in bu if p} |
+                                                    {p for _, p in dlc_best.values()}, key=lambda p: str(p))
             self.container_keys = o.keys
             self.container_key = self.romfs_container_identity(self.container_identity_paths)
             keyfile = self.aw / 'romfs_container.key'
@@ -510,7 +541,7 @@ class Port:
         if o.romfs_container:
             self.container_base, self.container_update = picks[self.pkg_ver]
             self.container_keys, self.container_exe = o.keys, Path(nx)
-            self.mount_romfs_containers(picks)
+            self.mount_romfs_containers(picks, m, dlc_best)
         bad = [] if self.derived else [f'{v}: {x}' for v in self.versions for x in nsp.build_mismatch(self.dirs[v], v, g)]
         if bad and self.provisional: raise BuildError(f'not the builds the provisional profile registers: {"; ".join(bad)}')
         if bad:
@@ -535,35 +566,27 @@ class Port:
                          f'profile registers' for x in lost_patches(g.builds(), self.game / 'ExeFS', g.words('modules'))]
             for x in self.lost: say(f'[RED] {x}')
         else: self.mem_profile()
-        if dlc_reused:
-            PROG.stage('extract DLC'); self.aoc = self.work / 'aoc'; PROG.end(f'{len(self.fam["dlc"])} DLC, reused (inputs unchanged)')
-        else:
-            self.aoc = nsp.extract_aoc(nx, o.keys, NXNATIVE, self.work, self.app,
-                                       dict(self.fam, base=m.get(self.fam['base'], self.fam['base']),   # with compressed DLC, extract_aoc tells a merged dump from a DLC NSP by comparing its paths against the base's: hand it the decompressed ones
-                                           dlc=[(t, v, m.get(p, p)) for t, v, p in self.fam['dlc']]), self.logs)
-            if zdlc: dkf.write_text(f'{dkey}\n')
-            else: nsp.rmtree(dkf)
-        # Keep the extracted DLC tree for shader analysis, but pack independent
-        # DLC NSPs directly when the RomFS is carried as a container.
         self.aoc_files = None
         if o.romfs_container:
-            best = {}
-            for tid, ver, p in self.fam['dlc']:
-                key = (ver or 0, p.stat().st_size)
-                if tid not in best or key > best[tid][0]:
-                    best[tid] = (key, p)
-
+            # Shader analysis sees the virtual AOC root; runtime packing keeps only independent DLC NSPs.
             self.aoc_files = {}
-            for tid, (_, p) in sorted(best.items()):
-                # DLC already integrated in the base container is read by the Host.
+            for tid, (_, p) in sorted(dlc_best.items()):
                 if p == self.fam['base']:
-                    continue
-
+                    continue   # integrated DLC is read from the base XCI by the Host
                 idx = tid - self.app - 0x1000
                 source = m.get(p, p)
                 if source.suffix.lower() != '.nsp':
                     raise BuildError(f'DLC {tid:016X}: expected an NSP after unpacking, got {source.name}')
                 self.aoc_files[f'aoc/{idx}.nsp'] = source
+        else:
+            if dlc_reused:
+                PROG.stage('extract DLC'); self.aoc = self.work / 'aoc'; PROG.end(f'{len(self.fam["dlc"])} DLC, reused (inputs unchanged)')
+            else:
+                self.aoc = nsp.extract_aoc(nx, o.keys, NXNATIVE, self.work, self.app,
+                                           dict(self.fam, base=m.get(self.fam['base'], self.fam['base']),   # with compressed DLC, extract_aoc tells a merged dump from a DLC NSP by comparing its paths against the base's: hand it the decompressed ones
+                                               dlc=[(t, v, m.get(p, p)) for t, v, p in self.fam['dlc']]), self.logs)
+                if zdlc: dkf.write_text(f'{dkey}\n')
+                else: nsp.rmtree(dkf)
         self.sysdata = self.extract_sysdata(nx)
         if not o.romfs_container: self.drop_unpacked()   # container readers remain live through the shader stages
         self.base = next((self.dirs[v] for v in self.versions if picks[v][1] is None), self.dirs[self.versions[0]])

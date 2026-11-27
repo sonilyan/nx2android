@@ -103,7 +103,8 @@ def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, 
             f'DM_LANG={language}']
     if language == 'system' and languages:
         rows.append('DM_LANG_SUPPORTED=' + ' '.join(languages))
-    if aoc or aoc_files: rows.append(f'DM_AOC_DIR={files_folder(package)}/aoc')
+    runtime_aoc = bool(aoc) if aoc_files is None else bool(aoc_files)
+    if runtime_aoc: rows.append(f'DM_AOC_DIR={files_folder(package)}/aoc')
     if sysdata: rows.append(f'DM_SYSDATA={files_folder(package)}/sysdata')
     rows += profile.env + list(env)
     if bad := settings_registry.check_env(rows, ('profile', 'porter'), 'env.txt '): raise ValueError('; '.join(bad))   # nxnative/dm/settings.tsv

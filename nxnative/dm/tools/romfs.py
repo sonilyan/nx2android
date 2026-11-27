@@ -99,10 +99,9 @@ class Image:
 
 class Container:
     """The RomFS of a player's own container (an NSP, PFS0, or a gamecard image, XCI) through `nx_extract <keys> --serve <base> <update|->`: LibHac opens the base's
-    Program NCA and layers the update's BKTR over it exactly as the extraction does; an integrated image is passed as both sides so its Patch content meta (the update
-    the console runs) is what gets read. Requests: STAT / LIST / OPEN / READ / CLOSE, framed on stdin/stdout. The whole tree is indexed by the helper once at start, so
+    Program NCA (or a DLC Data NCA selected by title ID) and layers a matching update's BKTR over it exactly as the extraction does. Requests: STAT / LIST / OPEN / READ / CLOSE, framed on stdin/stdout. The whole tree is indexed by the helper once at start, so
     listing and stat'ing are cheap; the bytes are decrypted only as they are read."""
-    def __init__(self, base, update=None, keys=None, exe=None):
+    def __init__(self, base, update=None, keys=None, exe=None, dlc_title_id=None):
         self.base = _os.path.abspath(_os.fsdecode(base))
         self.update = _os.path.abspath(_os.fsdecode(update)) if update else None
         self.keys = _os.fsdecode(keys) if keys else _os.environ.get('DM_PROD_KEYS')
@@ -110,6 +109,7 @@ class Container:
         if not self.keys: raise OSError(f'{self.base}: no prod.keys (pass keys or set DM_PROD_KEYS)')
         if not exe: raise OSError('no nx_extract to read a container with (pass exe or set DM_ROMFS_EXE)')
         self.exe = exe
+        self.dlc_title_id = int(dlc_title_id, 16) if isinstance(dlc_title_id, str) else dlc_title_id
         self.files, self.dirs = {}, {}
         self._start_reader()
         self.stat_base = _os.stat(self.base)
@@ -117,8 +117,9 @@ class Container:
     def _start_reader(self):
         import subprocess
         self.err = tempfile.TemporaryFile()
-        self.proc = subprocess.Popen([self.exe, self.keys, '--serve', self.base, self.update or '-'],
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err, bufsize=0)
+        args = [self.exe, self.keys, '--serve', self.base, self.update or '-']
+        if self.dlc_title_id is not None: args += ['--dlc', f'{self.dlc_title_id:016x}']
+        self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err, bufsize=0)
         self.lock = threading.Lock()
         self.pid = _os.getpid()
         if self.proc.stdout.read(1) != b'\0': raise OSError(f'{self.base}: the container reader did not start: {self.message()}')
@@ -300,10 +301,39 @@ def _resolve(path):
     return None
 
 
+class AocRoot:
+    """A virtual AOC directory whose index children are backed by separately mounted DLC containers."""
+    def __init__(self, path, indices):
+        self.path = _os.path.abspath(_os.fsdecode(path))
+        self.indices = tuple(str(i) for i in indices)
+        self.index_set = set(self.indices)
+        self.stat_root = _os.stat(self.path)
+
+    def find(self, relative):
+        key = relative.strip('/')
+        if key and key not in self.index_set: raise FileNotFoundError(relative)
+        return key
+
+    def info(self, key):
+        if key == '' or key in self.index_set: return False, 0
+        raise FileNotFoundError(key)
+
+    def children(self, key):
+        if key != '': raise NotADirectoryError(key)
+        return [(index, index) for index in self.indices]
+
+    def reader(self, key): raise IsADirectoryError(key)
+    def stamp(self): return self.stat_root
+
+
 def mounts_from_env(var='DM_ROMFS_MOUNTS'):
-    """JSON [{path, base, update, keys, exe}] (a container view per RomFS dir the build would have extracted, porter/pipeline.py) into this process's mounts."""
+    """Restore container and virtual AOC mounts in shader subprocesses (porter/pipeline.py)."""
     for ent in json.loads(_os.environ.get(var) or '[]'):
-        mount(ent['path'], Container(ent['base'], ent.get('update') or None, ent.get('keys') or None, ent.get('exe') or None))
+        if ent.get('kind') == 'aoc_root':
+            mount(ent['path'], AocRoot(ent['path'], ent.get('indices', ())))
+        else:
+            mount(ent['path'], Container(ent['base'], ent.get('update') or None, ent.get('keys') or None,
+                                         ent.get('exe') or None, ent.get('dlc_title_id')))
 
 
 mounts_from_env()

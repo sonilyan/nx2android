@@ -1261,7 +1261,7 @@ class Port:
             say(f'RomFS compressed: {npk:,} of {nf:,} files packed, {raw / 2**30:.1f} GB → {out / 2**30:.1f} GB on the device')
             romfs, zenv = self.aw / 'romfs_zstd' / self.pkg_ver, ['DM_ROMFS_ZSTD=1']
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=romfs, shaders=self.dmsv,
-                             aoc=self.aoc, sysdata=self.sysdata, language=self.lang, languages=self.languages, package=self.package, env=self.fps_env + font_env + zenv + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
+                             aoc=self.aoc, aoc_files=self.aoc_files, sysdata=self.sysdata, language=self.lang, languages=self.languages, package=self.package, env=self.fps_env + font_env + zenv + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
                              + (['DM_MENU_BUTTON=0'] if self.o.no_menu_button else [])
                              + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
                              files={**self.fps_files, **font_files, **container_files}, romfs_container=container_meta,

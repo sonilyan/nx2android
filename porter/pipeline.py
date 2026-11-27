@@ -58,6 +58,7 @@ class Options:
     language: str = ''                 # a code, a name or system (default: English)
     app_name: str = ''                 # the launcher label (default: the game's name in its control data)
     install: bool = False              # install on the device after packing
+    apk_only: bool = False             # with install: update only the APK; leave the device game data untouched
     device: str = ''                   # adb serial
     replace_signer: bool = False       # uninstall an app of the same package signed with another key
     debug: bool = False                # a development build: debug information, debuggable, DM_CTL
@@ -1290,7 +1291,7 @@ class Port:
     # ---- install (optional) ----
     def install(self):
         install.install(self.apk_path, self.data_path, self.tools['adb'], self.o.device or self.cfg.get('device'), replace_signer=self.o.replace_signer,
-                        romfs_at=self.o.romfs_at, romfs_push=self.o.romfs_push)
+                        romfs_at=self.o.romfs_at, romfs_push=self.o.romfs_push, apk_only=self.o.apk_only)
 
 
 def emit_result(r):   # the last JSON event of a port (the GUI's done screen); a summary line in the other modes

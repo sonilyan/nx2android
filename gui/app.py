@@ -94,6 +94,7 @@ class PortTab(QWidget):
         refresh = QPushButton('Refresh'); refresh.clicked.connect(self.refresh_devices)
         dev = QWidget(); dh = QHBoxLayout(dev); dh.setContentsMargins(0, 0, 0, 0); dh.addWidget(self.install); dh.addWidget(self.device, 1); dh.addWidget(refresh)
         self.replace_signer = QCheckBox('Replace an app of the same package signed with another key (uninstalls it first: its saves are deleted)')
+        self.apk_only = QCheckBox('Only update the APK; do not push game data to the device')
         self.romfs_container = QCheckBox('Read RomFS directly from NSP/XCI (no extraction; recommended)')
         self.romfs_container.setChecked(True)
         self.romfs_container.setToolTip('The data pack carries the NSP/XCI and prod.keys. Android reads the game files directly from the container; no RomFS directory is extracted or copied.')
@@ -135,7 +136,7 @@ class PortTab(QWidget):
                              'Auto: 8 GB for a game version the profile was not tested with, none for a tested one.\n'
                              'Raise it (16, 24 …) if the game still runs out. It uses no memory and does not change the speed.')
         f.addRow('App name', self.app_name); f.addRow('Game language', self.language)
-        f.addRow('Output folder', path_row(self.out, self.pick_out)); f.addRow('Device', dev); f.addRow('', self.replace_signer)
+        f.addRow('Output folder', path_row(self.out, self.pick_out)); f.addRow('Device', dev); f.addRow('', self.replace_signer); f.addRow('', self.apk_only)
         f.addRow('', self.romfs_container)
         f.addRow('RomFS on the device', romfs); f.addRow('', self.romfs_push); sd_row = QWidget(); sr = QHBoxLayout(sd_row); sr.setContentsMargins(0, 0, 0, 0); sr.addWidget(self.romfs_sd); sr.addWidget(self.romfs_sd_warn); sr.addStretch(1)
         f.addRow('', sd_row)
@@ -253,7 +254,8 @@ class PortTab(QWidget):
             args.append('--install')
             if self.device.currentData(): args += ['--device', self.device.currentData()]
             if self.replace_signer.isChecked(): args.append('--replace-signer')
-            if not self.port_romfs_container: args += self.romfs_args()
+            if self.apk_only.isChecked(): args.append('--apk-only')
+            elif not self.port_romfs_container: args += self.romfs_args()
         if self.package.text().strip(): args += ['--package', self.package.text().strip()]
         if self.vercode.value(): args += ['--vercode-offset', str(self.vercode.value())]
         if self.headroom.value() >= 0: args += ['--alias-headroom', str(self.headroom.value())]
@@ -266,13 +268,13 @@ class PortTab(QWidget):
         if self.debug.isChecked(): args.append('--debug')
         if self.experimental.isChecked() and not self.info.get('supported'): args.append('--experimental')
         self.run(args)
-
     def install_now(self):
         if not self.result: return
         args = ['install', self.result['data'], '--apk', self.result['apk'], '--progress', 'json']
         if self.device.currentData(): args += ['--device', self.device.currentData()]
         if self.replace_signer.isChecked(): args.append('--replace-signer')
-        self.run(args + ([] if getattr(self, 'port_romfs_container', self.romfs_container.isChecked()) else self.romfs_args()))
+        if self.apk_only.isChecked(): args.append('--apk-only')
+        self.run(args + ([] if self.apk_only.isChecked() or getattr(self, 'port_romfs_container', self.romfs_container.isChecked()) else self.romfs_args()))
 
     def update_romfs_options(self, container):
         enabled = not container

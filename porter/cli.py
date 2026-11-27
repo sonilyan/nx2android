@@ -18,6 +18,7 @@ def _parser():
     po.add_argument('-l', '--language', default='', help='game language, a code, a name or system (default: English)')
     po.add_argument('--app-name', default='', help='the app\'s name on the device (default: the game\'s name)')
     po.add_argument('--install', action='store_true', help='install on the connected device afterwards')
+    po.add_argument('--apk-only', action='store_true', help='with --install: update only the APK; leave the game data on the device untouched')
     po.add_argument('--device', default='', help='adb serial of the device to install on')
     po.add_argument('--replace-signer', action='store_true', help='uninstall an app of the same package signed with another key first (deletes its saves)')
     po.add_argument('--debug', action='store_true', help='a development build: debug information, debuggable, DM_CTL key presses')
@@ -58,7 +59,7 @@ def _parser():
     po.add_argument('--jobs', type=int, default=os.cpu_count() or 8)
     po.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'), help='json: one JSON event per line, for the GUI')
     ins = sub.add_parser('install', help='install a port made earlier'); ins.add_argument('data', help='the data pack folder (<App>-data)'); ins.add_argument('--apk', help='the APK (default: <App>.apk beside the pack)')
-    ins.add_argument('--device', default=''); ins.add_argument('--replace-signer', action='store_true'); ins.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'))
+    ins.add_argument('--device', default=''); ins.add_argument('--replace-signer', action='store_true'); ins.add_argument('--apk-only', action='store_true', help='update only the APK; leave the game data on the device untouched'); ins.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'))
     _romfs_at(ins)
     dv = sub.add_parser('devices', help='the devices adb sees'); dv.add_argument('--json', action='store_true')
     t = sub.add_parser('tools', help='list, or download, the missing tools (Android NDK, .NET SDK, platform-tools) from Google and Microsoft')
@@ -168,6 +169,10 @@ def cmd_port(a):
         env = os.environ.get('NX2A_VERCODE_OFFSET', '').strip() or '0'
         try: offset = int(env)
         except ValueError: print(f'NX2A_VERCODE_OFFSET is not a number: {env}', file=sys.stderr); return 2
+    if a.apk_only and not a.install:
+        print('--apk-only needs --install', file=sys.stderr); return 2
+    if a.apk_only and (a.replace_signer or a.romfs_at is not None or a.romfs_push):
+        print('--apk-only cannot be combined with --replace-signer, --romfs-at or --romfs-push', file=sys.stderr); return 2
     if a.romfs_container and (a.romfs_at is not None or a.romfs_push):
         print('--romfs-container cannot be combined with --romfs-at or --romfs-push', file=sys.stderr); return 2
     if (a.romfs_at is not None or a.romfs_push) and not a.install: print('--romfs-at and --romfs-push are install options: add --install, or run porter install after the port', file=sys.stderr); return 2
@@ -183,12 +188,14 @@ def cmd_port(a):
 def cmd_install(a):
     from porter import config, datapack, install, toolchain
     from porter.upstream import BuildError, PROG
+    if a.apk_only and (a.replace_signer or a.romfs_at is not None or a.romfs_push):
+        print('--apk-only cannot be combined with --replace-signer, --romfs-at or --romfs-push', file=sys.stderr); return 2
     def go():
         data = Path(a.data).resolve()
         apk = Path(a.apk) if a.apk else data.with_name(data.name.removesuffix('-data') + '.apk')
         PROG.plan(1)
         cfg = config.load()
-        install.install(apk, data, toolchain.find_adb(cfg), a.device or cfg.get('device'), replace_signer=a.replace_signer, romfs_at=a.romfs_at, romfs_push=a.romfs_push)
+        install.install(apk, data, toolchain.find_adb(cfg), a.device or cfg.get('device'), replace_signer=a.replace_signer, romfs_at=a.romfs_at, romfs_push=a.romfs_push, apk_only=a.apk_only)
     return _with_progress(a.progress, go)
 
 

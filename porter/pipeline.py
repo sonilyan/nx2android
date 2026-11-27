@@ -570,8 +570,9 @@ class Port:
         if o.romfs_container:
             # Shader analysis sees the virtual AOC root; runtime packing keeps only independent DLC NSPs.
             self.aoc_files = {}
+            base_path = Path(self.fam['base']).resolve()
             for tid, (_, p) in sorted(dlc_best.items()):
-                if p == self.fam['base']:
+                if Path(p).resolve() == base_path:
                     continue   # integrated DLC is read from the base XCI by the Host
                 idx = tid - self.app - 0x1000
                 source = m.get(p, p)
@@ -1260,8 +1261,9 @@ class Port:
             base = Path(self.container_base)
             base_name = f'container/base{base.suffix.lower()}'
             container_files[base_name] = base
+            merged_container = bool(self.container_update and Path(self.container_update).resolve() == base.resolve())
             if self.container_update:
-                if Path(self.container_update).resolve() == base.resolve():
+                if merged_container:
                     update_name = base_name
                 else:
                     update = Path(self.container_update)
@@ -1270,14 +1272,13 @@ class Port:
             else: update_name = None
             keys_name = 'container/prod.keys'
             container_files[keys_name] = self.container_keys
-            merged_container = bool(self.container_update and Path(self.container_update).resolve() == base.resolve())
             container_meta = dict(base=base_name, update=update_name, keys=keys_name, merged=merged_container,
                                   base_name=base.name, update_name=Path(self.container_update).name if self.container_update else None,
                                   source_key=self.container_key)
             romfs = None
             zenv = [f'DM_ROMFS_CONTAINER={datapack.files_folder(self.package)}/{base_name}',
                     f'DM_PROD_KEYS={datapack.files_folder(self.package)}/{keys_name}']
-            if update_name: zenv.append(f'DM_ROMFS_UPDATE={datapack.files_folder(self.package)}/{update_name}')
+            if update_name and not merged_container: zenv.append(f'DM_ROMFS_UPDATE={datapack.files_folder(self.package)}/{update_name}')
             say(f'[ROMFS container] data pack will carry {len(container_files)} container/key file(s); no RomFS directory')
         if self.ap.romfs_zstd and romfs and romfs.is_dir():   # android.tsv romfs zstd: packed copies of the files that compress, made once into the build folder; the rest stay links to the extraction
             PROG.set(step='compressing the RomFS', done=0, total=1, unit='B')

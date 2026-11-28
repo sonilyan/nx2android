@@ -1,0 +1,5 @@
+# Ori and the Will of the Wisps on Android.
+# Experimental profile copied from upstream game metadata; Android boot and gameplay are not yet verified.
+status	experimental
+package	org.nx2a.t01008dd013200000
+orientation	landscape

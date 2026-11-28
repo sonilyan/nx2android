@@ -1,0 +1,5 @@
+# Ori and the Blind Forest: Definitive Edition on Android.
+# Experimental profile copied from upstream game metadata; Android boot and gameplay are not yet verified.
+status	experimental
+package	org.nx2a.t010061d00db74000
+orientation	landscape

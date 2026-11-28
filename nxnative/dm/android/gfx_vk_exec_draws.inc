@@ -203,7 +203,11 @@ static int prepare_draw(int prim, int indexed) {
               vk_cross_buf(S.vbuf[b].address, S.vbuf[b].size, &xvb[b], &xvo[b]);
       } }
     if (g_order_pending) { g_order_pending = 0; g_order_check = S.pass_open == 1; }   // an order-only barrier kept the pass open: decided below, once the draw's images are known
-    if (!begin_pass() || !pass_commit()) { g_vkst.skip_rt++; return 0; }
+    if (S.ms.a2c) pruned_color_end(&g_prune_split_a2c);
+    if (!begin_pass()) { g_vkst.skip_rt++; return 0; }
+    prune_masked_color();
+    if (!pass_commit()) { g_vkst.skip_rt++; return 0; }
+    uint32_t pruned_for_draw = g_pruned_color;
     if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) g_tracing = 1;
     uint64_t t0 = tick();
     VkCommandBuffer cb = vk_cmd();
@@ -309,7 +313,9 @@ static int prepare_draw(int prim, int indexed) {
         g_order_check = 0; vkshader_t *fs = k.raster_discard ? NULL : S.sh[1];
         if (g_pass_wmem || shader_wmem(S.sh[0]) || shader_wmem(fs) || shader_wmem(S.sh[2]) || order_feedback(3)) {
             g_order_ended++; vk_end_pass(); vk_img_barrier_all(vk_cmd());
-            if (!begin_pass() || !pass_commit()) { g_vkst.skip_rt++; return 0; }
+            if (!begin_pass()) { g_vkst.skip_rt++; return 0; }
+            if (pruned_for_draw) prune_masked_color();   // retain this draw's attachment compatibility
+            if (!pass_commit()) { g_vkst.skip_rt++; return 0; }
             cb = vk_cmd();
         } else g_order_kept++;
     }
